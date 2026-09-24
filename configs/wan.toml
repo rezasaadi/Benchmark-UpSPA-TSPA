@@ -1,0 +1,4 @@
+name = "wan"
+rtt_ms = 60.0
+jitter_ms = 5.0
+bandwidth_mbps = 50.0
