@@ -1,4 +1,4 @@
-# Optimized UpSPA and TSPA benchmark
+# UpSPA and TSPA benchmark
 
 A unified Rust benchmark for UpSPA and TSPA with separate client computation, storage-provider computation, and actual TCP end-to-end measurements over Linux LAN/WAN profiles.
 
