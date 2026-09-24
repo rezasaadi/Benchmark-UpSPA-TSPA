@@ -1,0 +1,10 @@
+*.rs text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.csv text eol=lf
+Implementation/dockerfile text eol=lf
+Implementation/src/protocols/tspa.rs -text
+Implementation/src/crypto_tspa.rs -text
+Implementation/src/crypto.rs -text

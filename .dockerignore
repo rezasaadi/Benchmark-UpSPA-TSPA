@@ -1,0 +1,12 @@
+.git
+target
+**/target
+results
+**/results
+**/__pycache__
+**/*.pyc
+**/*.zip
+**/*.pdf
+**/*.tex
+.idea
+.vscode
