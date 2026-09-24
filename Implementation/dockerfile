@@ -1,0 +1,10 @@
+FROM rust:1.93-bookworm
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends python3 iproute2 iputils-ping && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY Implementation ./Implementation
+COPY scripts ./scripts
+COPY configs ./configs
+ENV CARGO_TARGET_DIR=/app/target
+RUN bash scripts/build.sh
+ENTRYPOINT ["/app/target/release/bench_unified"]
