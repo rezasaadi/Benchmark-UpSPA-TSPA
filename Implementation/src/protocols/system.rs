@@ -6,7 +6,7 @@ use crate::{
 use curve25519_dalek::ristretto::CompressedRistretto;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{OsRng, RngCore, SeedableRng};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CallSample {
@@ -25,6 +26,7 @@ pub struct CallSample {
     pub bytes_received: Option<u64>,
     pub success: bool,
     pub error: String,
+    pub reply_missing_at_bound: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,8 +46,8 @@ pub struct Trace {
 
 pub struct IdentifiedState {
     pub ssk: SigningKey,
-    pub rsp: Key,
-    pub k0: Key,
+    pub rsp: Zeroizing<Key>,
+    pub k0: Zeroizing<Key>,
     pub timestamp: u64,
 }
 
@@ -62,10 +64,25 @@ pub enum Requirement {
     AllProviders,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RngMode {
+    #[default]
+    OsEntropy,
+    Deterministic(Key),
+}
+
+// Preserve callers that explicitly supply a deterministic seed.
+impl From<Key> for RngMode {
+    fn from(seed: Key) -> Self {
+        Self::Deterministic(seed)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Policy {
     All,
     Agreement(usize),
+    Delivery,
 }
 
 pub fn account_context(uid: &[u8], ls: &[u8]) -> Vec<u8> {
@@ -151,6 +168,20 @@ impl AgreementTracker {
     }
 }
 
+fn require_read_replies(replies: &[(u32, Reply)], root: bool) -> Result<()> {
+    for (_, reply) in replies {
+        let expected = if root {
+            matches!(reply, Reply::Identification { .. })
+        } else {
+            matches!(reply, Reply::Account(_))
+        };
+        if !expected || agreement_key(reply).is_none() {
+            return Err("malformed provider read reply".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn unique_agreement(
     replies: &[(u32, Reply)],
     threshold: usize,
@@ -170,9 +201,10 @@ pub struct System {
     pub trace: Arc<Mutex<Trace>>,
     rng: ChaCha20Rng,
     deadline: Duration,
+    delivery_bound: Duration,
     running: Vec<JoinHandle<()>>,
-    finalization: Option<(Vec<(Target, Request)>, bool)>,
     ls_resolution: Option<LsResolution>,
+    ls_outcome_probe: bool,
 }
 
 impl System {
@@ -180,7 +212,7 @@ impl System {
         n: usize,
         t: usize,
         transport: Arc<dyn Transport>,
-        seed: Key,
+        rng_mode: impl Into<RngMode>,
         deadline: Duration,
     ) -> Result<Self> {
         if n == 0 || t == 0 || t > n || n > 100 {
@@ -191,11 +223,16 @@ impl System {
             t,
             transport,
             trace: Arc::new(Mutex::new(Trace::default())),
-            rng: ChaCha20Rng::from_seed(seed),
+            rng: match rng_mode.into() {
+                RngMode::OsEntropy => ChaCha20Rng::from_rng(OsRng)
+                    .map_err(|error| format!("OS entropy unavailable: {error}"))?,
+                RngMode::Deterministic(seed) => ChaCha20Rng::from_seed(seed),
+            },
             deadline,
+            delivery_bound: deadline,
             running: Vec::new(),
-            finalization: None,
             ls_resolution: None,
+            ls_outcome_probe: false,
         })
     }
 
@@ -206,10 +243,20 @@ impl System {
         result
     }
 
+    pub fn with_delivery_bound(mut self, delivery_bound: Duration) -> Self {
+        self.delivery_bound = delivery_bound;
+        self
+    }
+
     pub async fn settle(&mut self) {
         for task in self.running.drain(..) {
             let _ = task.await;
         }
+    }
+
+    pub fn with_ls_outcome_probe(mut self, enabled: bool) -> Self {
+        self.ls_outcome_probe = enabled;
+        self
     }
 
     pub async fn reset(&mut self) -> Result<()> {
@@ -232,7 +279,6 @@ impl System {
         for response in responses {
             require_ack(response?)?;
         }
-        self.finalization = None;
         self.ls_resolution = None;
         self.clear_trace();
         Ok(())
@@ -251,6 +297,10 @@ impl System {
         let start = Instant::now();
         let count = requests.len();
         let stage_id = self.trace.lock().unwrap().stages.len();
+        let targets: Vec<_> = requests
+            .iter()
+            .map(|(target, request)| (*target, request.operation().to_owned()))
+            .collect();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         for (target, request) in requests {
             let sender = sender.clone();
@@ -258,6 +308,7 @@ impl System {
             let trace = self.trace.clone();
             self.running.push(tokio::spawn(async move {
                 let operation = request.operation().to_owned();
+                let final_reply = matches!(request, Request::Up(UpRequest::Finalize { .. }));
                 let packet = transport.call(target, request).await;
                 let (result, processing_ns, bytes_sent, bytes_received) = match packet {
                     Ok(packet) => (
@@ -268,9 +319,10 @@ impl System {
                     ),
                     Err(error) => (Err(error), None, None, None),
                 };
-                let success = result
-                    .as_ref()
-                    .is_ok_and(|reply| !matches!(reply, Reply::Ack(false)));
+                let success = result.as_ref().is_ok_and(|reply| {
+                    !matches!(reply, Reply::Ack(false))
+                        && (!final_reply || matches!(reply, Reply::Ack(true)))
+                });
                 let error = result.as_ref().err().cloned().unwrap_or_else(|| {
                     if success {
                         String::new()
@@ -278,7 +330,7 @@ impl System {
                         "operation rejected".into()
                     }
                 });
-                trace.lock().unwrap().calls.push(CallSample {
+                let mut sample = CallSample {
                     stage_id,
                     target,
                     operation,
@@ -287,23 +339,43 @@ impl System {
                     bytes_received,
                     success,
                     error,
-                });
-                let _ = sender.send((target, result));
+                    reply_missing_at_bound: false,
+                };
+                let mut trace = trace.lock().unwrap();
+                if let Some(existing) = trace
+                    .calls
+                    .iter_mut()
+                    .find(|call| call.stage_id == stage_id && call.target == target)
+                {
+                    sample.reply_missing_at_bound = existing.reply_missing_at_bound;
+                    *existing = sample;
+                } else {
+                    trace.calls.push(sample);
+                }
+                drop(trace);
+                let _ = sender.send((target, result, processing_ns.is_some()));
             }));
         }
         drop(sender);
-        let deadline = tokio::time::Instant::now() + self.deadline;
+        let deadline = tokio::time::Instant::now()
+            + if matches!(policy, Policy::Delivery) {
+                self.delivery_bound
+            } else {
+                self.deadline
+            };
         let mut replies = Vec::new();
         let mut first_error = None;
         let mut received = 0;
+        let mut received_targets = HashSet::new();
         let mut agreement = match policy {
             Policy::Agreement(threshold) => Some(AgreementTracker::new(threshold)?),
-            Policy::All => None,
+            Policy::All | Policy::Delivery => None,
         };
         let result = loop {
             if received == count {
                 break match policy {
                     Policy::All => first_error.map_or_else(|| Ok(replies.clone()), Err),
+                    Policy::Delivery => Ok(replies.clone()),
                     Policy::Agreement(_) => agreement
                         .as_ref()
                         .expect("agreement tracker must exist")
@@ -311,13 +383,47 @@ impl System {
                         .and_then(|result| result.ok_or("no agreement".into())),
                 };
             }
-            let Some((target, response)) = tokio::time::timeout_at(deadline, receiver.recv())
-                .await
-                .unwrap_or(None)
+            let Some((target, response, has_reply)) =
+                tokio::time::timeout_at(deadline, receiver.recv())
+                    .await
+                    .unwrap_or(None)
             else {
+                if matches!(policy, Policy::Delivery) {
+                    tokio::time::sleep_until(deadline).await;
+                    let mut trace = self.trace.lock().unwrap();
+                    for (target, operation) in &targets {
+                        if received_targets.contains(target) {
+                            continue;
+                        }
+                        if let Some(call) = trace
+                            .calls
+                            .iter_mut()
+                            .find(|call| call.stage_id == stage_id && call.target == *target)
+                        {
+                            call.reply_missing_at_bound = true;
+                        } else {
+                            trace.calls.push(CallSample {
+                                stage_id,
+                                target: *target,
+                                operation: operation.clone(),
+                                processing_ns: None,
+                                bytes_sent: None,
+                                bytes_received: None,
+                                success: false,
+                                error: "final reply missing at delivery bound".into(),
+                                reply_missing_at_bound: true,
+                            });
+                        }
+                    }
+                    break Ok(replies.clone());
+                }
                 break Err("stage deadline exceeded".into());
             };
+            if matches!(policy, Policy::Delivery) && !has_reply {
+                continue;
+            }
             received += 1;
+            received_targets.insert(target);
             let processed = self.compute(|_| -> Result<Option<Vec<(u32, Reply)>>> {
                 match response {
                     Ok(reply) => {
@@ -341,7 +447,7 @@ impl System {
                         .as_ref()
                         .expect("agreement tracker must exist")
                         .resolve(count - received),
-                    Policy::All => Ok(None),
+                    Policy::All | Policy::Delivery => Ok(None),
                 }
             });
             match processed {
@@ -391,38 +497,17 @@ impl System {
             .collect()
     }
 
-    async fn finalize(&mut self, requests: Vec<(Target, Request)>, store: bool) -> Result<()> {
-        self.finalization = Some((requests.clone(), store));
-        let mut last = Err("finalization incomplete".into());
-        for _ in 0..3 {
-            let result = self
-                .stage("finalization", requests.clone(), Policy::All)
-                .await;
-            last = result.and_then(|replies| {
-                if store {
-                    for (_, reply) in replies {
-                        require_ack(reply)?;
-                    }
-                }
-                Ok(())
-            });
-            if last.is_ok() {
-                self.finalization = None;
-                return Ok(());
-            }
-        }
-        Err(format!(
-            "finalization incomplete; retained for resume: {}",
-            last.unwrap_err()
-        ))
+    async fn finalize(&mut self, requests: Vec<(Target, Request)>, _store: bool) -> Result<()> {
+        self.stage("finalization", requests, Policy::Delivery)
+            .await?;
+        Ok(())
     }
 
     pub async fn resume_finalization(&mut self) -> Result<()> {
-        if self.ls_resolution.is_some() {
-            return self.resolve_ls().await;
+        if !self.ls_outcome_probe {
+            return Err("LS outcome probing is disabled".into());
         }
-        let (requests, store) = self.finalization.clone().ok_or("no finalization pending")?;
-        self.finalize(requests, store).await
+        self.resolve_ls().await
     }
 
     async fn resolve_ls(&mut self) -> Result<()> {
@@ -462,7 +547,7 @@ impl System {
     }
 
     fn require_idle(&self) -> Result<()> {
-        if self.finalization.is_some() || self.ls_resolution.is_some() {
+        if self.ls_outcome_probe && self.ls_resolution.is_some() {
             Err("finalization must complete before another phase".into())
         } else {
             Ok(())
@@ -476,26 +561,28 @@ impl System {
         let (sid, requests) = self.compute(|rng| {
             let mut sid = [0; 16];
             rng.fill_bytes(&mut sid);
-            let mut rsp = [0; 32];
-            rng.fill_bytes(&mut rsp);
+            let mut rsp = Zeroizing::new([0; 32]);
+            rng.fill_bytes(&mut *rsp);
             let (key, shares) = crypto::toprf_gen(n, t, rng);
-            let mut ssk = [0; 32];
-            rng.fill_bytes(&mut ssk);
+            let mut ssk = Zeroizing::new([0; 32]);
+            rng.fill_bytes(&mut *ssk);
             let signing = SigningKey::from_bytes(&ssk);
-            let mut k0 = [0; 32];
-            rng.fill_bytes(&mut k0);
-            let mut plaintext = [0; ROOT_LEN];
-            plaintext[..32].copy_from_slice(&ssk);
-            plaintext[32..64].copy_from_slice(&rsp);
-            plaintext[64..].copy_from_slice(&k0);
-            let encryption =
-                crypto::oprf_finalize(password, &(crypto::hash_to_point(password) * key));
+            let mut k0 = Zeroizing::new([0; 32]);
+            rng.fill_bytes(&mut *k0);
+            let mut plaintext = Zeroizing::new([0; ROOT_LEN]);
+            plaintext[..32].copy_from_slice(&*ssk);
+            plaintext[32..64].copy_from_slice(&*rsp);
+            plaintext[64..].copy_from_slice(&*k0);
+            let encryption = crypto::oprf_finalize(
+                password,
+                &Zeroizing::new(crypto::hash_to_point(password) * *key),
+            );
             let cid = crypto::xchacha_encrypt_detached(&encryption, &[], &plaintext, rng).encode();
             let requests = shares
-                .into_iter()
+                .iter()
                 .map(|(id, share)| {
                     (
-                        Target::Provider(id),
+                        Target::Provider(*id),
                         Request::Up(UpRequest::Setup {
                             sid,
                             root: Root {
@@ -529,8 +616,8 @@ impl System {
     ) -> Result<IdentifiedState> {
         let n = self.n;
         let (r, requests) = self.compute(|rng| {
-            let r = crypto::random_scalar(rng);
-            let blinded = (crypto::hash_to_point(password) * r).compress().to_bytes();
+            let r = Zeroizing::new(crypto::random_scalar(rng));
+            let blinded = (crypto::hash_to_point(password) * *r).compress().to_bytes();
             (
                 r,
                 (1..=n)
@@ -556,6 +643,7 @@ impl System {
             let accepted = match requirement {
                 Requirement::Threshold => replies,
                 Requirement::AllProviders => {
+                    require_read_replies(&replies, true)?;
                     unique_agreement(&replies, threshold, 0)?.ok_or("no root agreement")?
                 }
             };
@@ -580,7 +668,7 @@ impl System {
             }
             let key = crypto::toprf_client_eval_from_partials(
                 password,
-                r,
+                *r,
                 &points,
                 &crypto::lagrange_coeffs_at_zero(&ids),
             );
@@ -588,9 +676,9 @@ impl System {
                 crypto::xchacha_decrypt_detached(&key, &[], &decode_blob::<ROOT_LEN>(cid)?)
                     .map_err(|_| "root decryption failed")?;
             Ok(IdentifiedState {
-                ssk: SigningKey::from_bytes(&plaintext[..32].try_into().unwrap()),
-                rsp: plaintext[32..64].try_into().unwrap(),
-                k0: plaintext[64..].try_into().unwrap(),
+                ssk: SigningKey::from_bytes(plaintext[..32].try_into().unwrap()),
+                rsp: Zeroizing::new(plaintext[32..64].try_into().unwrap()),
+                k0: Zeroizing::new(plaintext[64..].try_into().unwrap()),
                 timestamp: *timestamp,
             })
         })
@@ -601,7 +689,8 @@ impl System {
         uid: &[u8],
         ls: &[u8],
         state: &IdentifiedState,
-    ) -> Result<(Key, u64, Vec<u8>)> {
+        requirement: Requirement,
+    ) -> Result<(Zeroizing<Key>, u64, Vec<u8>)> {
         let n = self.n;
         let requests = self.compute(|_| {
             (1..=n)
@@ -615,10 +704,20 @@ impl System {
                 })
                 .collect()
         });
-        let replies = self
-            .stage("account_recovery", requests, Policy::Agreement(self.t))
-            .await?;
+        let policy = match requirement {
+            Requirement::Threshold => Policy::Agreement(self.t),
+            Requirement::AllProviders => Policy::All,
+        };
+        let replies = self.stage("account_recovery", requests, policy).await?;
+        let threshold = self.t;
         self.compute(|_| {
+            let replies = match requirement {
+                Requirement::Threshold => replies,
+                Requirement::AllProviders => {
+                    require_read_replies(&replies, false)?;
+                    unique_agreement(&replies, threshold, 0)?.ok_or("no account agreement")?
+                }
+            };
             let Reply::Account(ciphertext) = &replies[0].1 else {
                 return Err("invalid account response".into());
             };
@@ -629,7 +728,7 @@ impl System {
             )
             .map_err(|_| "account decryption failed")?;
             Ok((
-                plaintext[..32].try_into().unwrap(),
+                Zeroizing::new(plaintext[..32].try_into().unwrap()),
                 u64::from_le_bytes(plaintext[32..].try_into().unwrap()),
                 ciphertext.clone(),
             ))
@@ -661,7 +760,9 @@ impl System {
         let state = self
             .identification(uid, password, Requirement::AllProviders)
             .await?;
-        let old = self.recover(uid, ls, &state).await?;
+        let old = self
+            .recover(uid, ls, &state, Requirement::AllProviders)
+            .await?;
         self.account_write(uid, ls, login_uid, &state, Some(old))
             .await
     }
@@ -672,7 +773,7 @@ impl System {
         ls: &[u8],
         login_uid: &[u8],
         state: &IdentifiedState,
-        old: Option<(Key, u64, Vec<u8>)>,
+        old: Option<(Zeroizing<Key>, u64, Vec<u8>)>,
     ) -> Result<()> {
         let n = self.n;
         let phase = if old.is_some() {
@@ -687,11 +788,11 @@ impl System {
             };
             let mut sid = [0; 16];
             rng.fill_bytes(&mut sid);
-            let mut secret = [0; 32];
-            rng.fill_bytes(&mut secret);
+            let mut secret = Zeroizing::new([0; 32]);
+            rng.fill_bytes(&mut *secret);
             let verifier = crypto::hash_vinfo(&secret, ls);
-            let mut plaintext = [0; ACCOUNT_LEN];
-            plaintext[..32].copy_from_slice(&secret);
+            let mut plaintext = Zeroizing::new([0; ACCOUNT_LEN]);
+            plaintext[..32].copy_from_slice(&*secret);
             plaintext[32..].copy_from_slice(&counter.to_le_bytes());
             let ciphertext = crypto::xchacha_encrypt_detached(
                 &state.k0,
@@ -764,7 +865,7 @@ impl System {
                     && call.target == Target::LoginServer
                     && call.processing_ns.is_some()
             });
-        if uncertain {
+        if uncertain && self.ls_outcome_probe {
             self.settle().await;
             self.ls_resolution = Some(LsResolution {
                 probe,
@@ -790,7 +891,9 @@ impl System {
         let state = self
             .identification(uid, password, Requirement::Threshold)
             .await?;
-        let (secret, _, _) = self.recover(uid, ls, &state).await?;
+        let (secret, _, _) = self
+            .recover(uid, ls, &state, Requirement::Threshold)
+            .await?;
         let request = self.compute(|_| {
             Request::Ls(LsRequest::Authenticate {
                 uid: login_uid.to_vec(),
@@ -819,21 +922,24 @@ impl System {
             let (key, shares) = crypto::toprf_gen(n, t, rng);
             let timestamp =
                 now_ms().max(state.timestamp.checked_add(1).ok_or("timestamp overflow")?);
-            let encryption =
-                crypto::oprf_finalize(new_password, &(crypto::hash_to_point(new_password) * key));
-            let mut plaintext = [0; ROOT_LEN];
-            plaintext[..32].copy_from_slice(&state.ssk.to_bytes());
-            plaintext[32..64].copy_from_slice(&state.rsp);
-            plaintext[64..].copy_from_slice(&state.k0);
+            let encryption = crypto::oprf_finalize(
+                new_password,
+                &Zeroizing::new(crypto::hash_to_point(new_password) * *key),
+            );
+            let ssk = Zeroizing::new(state.ssk.to_bytes());
+            let mut plaintext = Zeroizing::new([0; ROOT_LEN]);
+            plaintext[..32].copy_from_slice(&*ssk);
+            plaintext[32..64].copy_from_slice(&*state.rsp);
+            plaintext[64..].copy_from_slice(&*state.k0);
             let cid = crypto::xchacha_encrypt_detached(&encryption, &[], &plaintext, rng).encode();
             let requests = shares
-                .into_iter()
+                .iter()
                 .map(|(id, share)| {
                     let mut update = PasswordUpdate {
                         operation: "PwdUpdate".into(),
                         sid,
                         uid: uid.to_vec(),
-                        provider_id: id,
+                        provider_id: *id,
                         timestamp_old: state.timestamp,
                         timestamp_new: timestamp,
                         cid_new: cid.clone(),
@@ -842,7 +948,7 @@ impl System {
                     };
                     update.signature = state.ssk.sign(&update.signed_bytes()).to_bytes().to_vec();
                     (
-                        Target::Provider(id),
+                        Target::Provider(*id),
                         Request::Up(UpRequest::PasswordUpdate(update)),
                     )
                 })
