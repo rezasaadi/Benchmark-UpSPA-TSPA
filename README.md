@@ -31,6 +31,8 @@ docs/                      Protocol mapping and measurement methodology
 
 ## Build and test
 
+Library clients select `RngMode::default()` for OS-entropy-seeded ChaCha20. The benchmark keeps deterministic per-run seeds and records `"rng": "deterministic-per-run"`. UpSPA transient secrets use zeroizing guards on completion and error paths.
+
 Use Linux or Ubuntu under WSL2, with Rust/Cargo, Python 3.11+, `iproute2`, and `iputils-ping` installed. Run commands from the repository root. Measurement collection requires Linux and a release build. Network experiments require permission to run `sudo` and a kernel supporting network namespaces, veth, and netem.
 
 ```bash
@@ -91,6 +93,20 @@ python3 scripts/run.py local --sweep scale60 --out results/scale60
 
 ## Outputs and summaries
 
+The benchmark LS username is the SPA uid (`user123`), matching the paper's base construction. The separate `login_uid` library parameter remains available.
+
+Protocol policy flags are accepted by `bench_unified` and the Python experiment driver:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--attempt-limit` | `100` | Maximum contributed Identify evaluations per user and committed TOPRF instance/window; also accepted by `network-node` |
+| `--attempt-window-ms` | `60000` | Fixed counting window; `0` gives a lifetime cap for each instance; also accepted by `network-node` |
+| `--deadline-ms` | `10000` | Required read, preparation and LS response deadline |
+| `--delivery-bound-ms` | value of `--deadline-ms` | Finalization delivery bound; complete sooner if all final replies arrive |
+| `--ls-outcome-probe` | off | Extension outside the paper: probe an unknown LS outcome and retain unresolved preparations for resume |
+
+After choosing Store/Discard, UpSPA dispatches one decision to every provider and completes on all replies or the delivery bound, whichever comes first. Missing or failed final replies are traced and cannot reverse Store. With honest providers, replies arrive before the bound, so E2E timing remains comparable to the previous acknowledgement-based timing.
+
 Choose a new output directory for each experiment. Existing output directories are rejected. Each result set contains raw timing CSVs, provider-request timings, stage timings, JSONL traces, and environment/build metadata. Network result sets also contain profile and ping-verification records.
 
 ```bash
@@ -102,6 +118,8 @@ python3 scripts/summarize.py results --out results/summary
 A functional smoke run uses `--smoke --warmup 0 --measured 1`. The driver includes smoke samples in that run's immediate summary; ordinary later summary generation excludes them unless `--include-smoke` is supplied. Smoke results are not performance measurements.
 
 ## Optional container build
+
+Default UpSPA behavior discards provider preparations and returns FAIL after an LS transport error or response deadline. The optional outcome-probe mode can retain preparations and block the client until `resume_finalization` resolves the LS outcome; it is outside the paper's model.
 
 Build from the repository root:
 
