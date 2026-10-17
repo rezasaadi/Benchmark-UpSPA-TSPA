@@ -131,7 +131,7 @@ fn finalization_is_sid_bound() {
     );
     assert_eq!(
         finish(&mut provider, root_binding(Phase::Setup, 2), false),
-        Reply::Ack(false)
+        Reply::Ack(true)
     );
     assert!(provider.roots.is_empty());
     assert_eq!(provider.pending.len(), 1);
@@ -147,6 +147,70 @@ fn finalization_is_phase_bound() {
     );
     assert!(provider.roots.is_empty());
     assert_eq!(provider.pending.len(), 1);
+}
+
+#[test]
+fn empty_discard_succeeds_store_fails_and_late_preparation_cannot_revive_discard() {
+    let mut provider = UpSpaProvider::new(1, 1000);
+    let binding = root_binding(Phase::Setup, 1);
+    assert_eq!(
+        finish(&mut provider, binding.clone(), true),
+        Reply::Ack(false)
+    );
+    assert_eq!(
+        finish(&mut provider, binding.clone(), false),
+        Reply::Ack(true)
+    );
+    assert_eq!(
+        finish(&mut provider, binding.clone(), false),
+        Reply::Ack(true)
+    );
+    assert_eq!(finish(&mut provider, binding, true), Reply::Ack(false));
+    assert!(provider
+        .handle(
+            UpRequest::Setup {
+                sid: [1; 16],
+                root: root()
+            },
+            100
+        )
+        .is_err());
+    assert!(provider.roots.is_empty());
+    assert!(provider.pending.is_empty());
+}
+
+#[test]
+fn discard_after_rejected_preparation_preserves_other_pending_write() {
+    let mut provider = UpSpaProvider::new(1, 1000);
+    setup(&mut provider);
+    assert!(provider
+        .handle(
+            UpRequest::Setup {
+                sid: [2; 16],
+                root: root()
+            },
+            100
+        )
+        .is_err());
+    assert_eq!(
+        finish(&mut provider, root_binding(Phase::Setup, 2), false),
+        Reply::Ack(true)
+    );
+    assert_eq!(
+        finish(&mut provider, root_binding(Phase::Setup, 2), true),
+        Reply::Ack(false)
+    );
+    assert_eq!(provider.pending.len(), 1);
+    assert_eq!(
+        finish(&mut provider, root_binding(Phase::Setup, 1), true),
+        Reply::Ack(true)
+    );
+    let roots = provider.roots.clone();
+    assert_eq!(
+        finish(&mut provider, root_binding(Phase::Setup, 1), false),
+        Reply::Ack(false)
+    );
+    assert_eq!(provider.roots, roots);
 }
 
 #[test]
@@ -233,9 +297,6 @@ fn password_signature_binds_every_required_field() {
     item.operation = "Other".into();
     changed.push(item);
     let mut item = original.clone();
-    item.sid[0] ^= 1;
-    changed.push(item);
-    let mut item = original.clone();
     item.uid.push(0);
     changed.push(item);
     let mut item = original.clone();
@@ -254,12 +315,79 @@ fn password_signature_binds_every_required_field() {
     item.share_new = Scalar::from(20u64).to_bytes();
     changed.push(item);
     for request in changed {
+        let signature = ed25519_dalek::Signature::from_slice(&original.signature).unwrap();
+        let key = SigningKey::from_bytes(&[11; 32]).verifying_key();
+        assert!(key
+            .verify_strict(&request.signed_bytes(), &signature)
+            .is_err());
         let mut provider = committed();
         assert!(provider
             .handle(UpRequest::PasswordUpdate(request), 100)
             .is_err());
         assert!(provider.pending.is_empty());
     }
+}
+
+#[test]
+fn password_store_rechecks_old_timestamp_without_changing_any_state() {
+    for remove_root in [false, true] {
+        let mut provider = committed();
+        provider
+            .handle(UpRequest::PasswordUpdate(update()), 100)
+            .unwrap();
+        if remove_root {
+            provider.roots.remove(b"alice".as_slice());
+        } else {
+            provider
+                .roots
+                .get_mut(b"alice".as_slice())
+                .unwrap()
+                .timestamp = 50;
+        }
+        let roots = provider.roots.clone();
+        let completed = provider.completed.clone();
+        for _ in 0..2 {
+            assert_eq!(
+                finish(&mut provider, root_binding(Phase::PasswordUpdate, 2), true),
+                Reply::Ack(false)
+            );
+            assert_eq!(provider.roots, roots);
+            assert_eq!(provider.completed, completed);
+            assert_eq!(provider.pending.len(), 1);
+            assert_eq!(
+                provider.pending.values().next().unwrap().timestamp_old,
+                Some(0)
+            );
+        }
+        assert_eq!(
+            finish(&mut provider, root_binding(Phase::PasswordUpdate, 2), false),
+            Reply::Ack(true)
+        );
+        assert_eq!(provider.roots, roots);
+    }
+}
+
+#[test]
+fn password_signature_is_exactly_the_paper_tuple_and_excludes_sid() {
+    let original = update();
+    let expected = bincode::serialize(&(
+        "PwdUpdate",
+        original.uid.as_slice(),
+        original.provider_id,
+        original.timestamp_old,
+        original.timestamp_new,
+        original.cid_new.as_slice(),
+        original.share_new,
+    ))
+    .unwrap();
+    assert_eq!(original.signed_bytes(), expected);
+    let mut other_session = original.clone();
+    other_session.sid[0] ^= 1;
+    assert_eq!(other_session.signed_bytes(), original.signed_bytes());
+    assert_eq!(
+        committed().handle(UpRequest::PasswordUpdate(other_session), 100),
+        Ok(Reply::Ack(true))
+    );
 }
 
 #[test]
@@ -303,6 +431,115 @@ fn clock_window_is_enforced() {
     assert!(committed()
         .handle(UpRequest::PasswordUpdate(update()), 2000)
         .is_err());
+}
+
+fn identify_request() -> UpRequest {
+    UpRequest::Identify {
+        uid: b"alice".to_vec(),
+        blinded: crypto::hash_to_point(b"pwd").compress().to_bytes(),
+    }
+}
+
+#[test]
+fn attempt_policy_limits_contributions_and_starts_a_new_fixed_window() {
+    let mut provider = committed().with_attempt_policy(2, 50);
+    for time in [100, 120] {
+        assert!(matches!(
+            provider.handle(identify_request(), time),
+            Ok(Reply::Identification { .. })
+        ));
+    }
+    assert_eq!(
+        provider.handle(identify_request(), 149),
+        Err("attempt limit".into())
+    );
+    assert!(provider.handle(identify_request(), 150).is_ok());
+    assert!(provider.handle(identify_request(), 151).is_ok());
+    assert_eq!(
+        provider.handle(identify_request(), 152),
+        Err("attempt limit".into())
+    );
+}
+
+#[test]
+fn lifetime_cap_is_per_user_and_committed_toprf_instance() {
+    let mut provider = committed().with_attempt_policy(1, 0);
+    assert!(provider.handle(identify_request(), 100).is_ok());
+    assert_eq!(
+        provider.handle(identify_request(), u64::MAX),
+        Err("attempt limit".into())
+    );
+    provider
+        .handle(UpRequest::PasswordUpdate(update()), 100)
+        .unwrap();
+    assert_eq!(
+        provider.handle(identify_request(), 100),
+        Err("attempt limit".into())
+    );
+    finish(&mut provider, root_binding(Phase::PasswordUpdate, 2), true);
+    assert!(provider.handle(identify_request(), 100).is_ok());
+    assert_eq!(
+        provider.handle(identify_request(), 101),
+        Err("attempt limit".into())
+    );
+    let mut other = root();
+    other.uid = b"bob".to_vec();
+    provider.roots.insert(other.uid.clone(), other);
+    let UpRequest::Identify { blinded, .. } = identify_request() else {
+        unreachable!()
+    };
+    assert!(provider
+        .handle(
+            UpRequest::Identify {
+                uid: b"bob".to_vec(),
+                blinded
+            },
+            100
+        )
+        .is_ok());
+}
+
+#[test]
+fn reset_clears_attempts_and_preserves_configured_policy() {
+    let mut provider = committed().with_attempt_policy(1, 0);
+    provider.handle(identify_request(), 100).unwrap();
+    let mut node = Node::Provider {
+        upspa: Box::new(provider),
+        tspa: tspa::protocols::sp::TspaProvider::new(1, Scalar::ONE),
+    };
+    assert_eq!(node.handle(Request::Reset).result, Ok(Reply::Ack(true)));
+    let Node::Provider { upspa, .. } = &mut node else {
+        unreachable!()
+    };
+    assert_eq!((upspa.attempt_limit, upspa.attempt_window_ms), (1, 0));
+    setup(upspa);
+    finish(upspa, root_binding(Phase::Setup, 1), true);
+    assert!(upspa.handle(identify_request(), 100).is_ok());
+    assert_eq!(
+        upspa.handle(identify_request(), 101),
+        Err("attempt limit".into())
+    );
+}
+
+#[test]
+fn invalid_identify_does_not_consume_attempt_and_zero_limit_rejects_all() {
+    let mut provider = committed().with_attempt_policy(1, 0);
+    assert!(provider
+        .handle(
+            UpRequest::Identify {
+                uid: b"alice".to_vec(),
+                blinded: [255; 32]
+            },
+            100
+        )
+        .is_err());
+    assert!(provider.handle(identify_request(), 100).is_ok());
+    assert_eq!(
+        committed()
+            .with_attempt_policy(0, 0)
+            .handle(identify_request(), 100),
+        Err("attempt limit".into())
+    );
 }
 
 fn identification_reply(cid: u8, timestamp: u64) -> Reply {
