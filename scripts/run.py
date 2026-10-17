@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--scheme", default="all")
     parser.add_argument("--phase", default="all")
+    parser.add_argument("--attempt-limit", type=int, default=100)
+    parser.add_argument("--attempt-window-ms", type=int, default=60000)
+    parser.add_argument("--deadline-ms", type=int, default=10000)
+    parser.add_argument("--delivery-bound-ms", type=int)
+    parser.add_argument("--ls-outcome-probe", action="store_true")
     parser.add_argument("--rtt-ms", type=float)
     parser.add_argument("--jitter-ms", type=float)
     parser.add_argument("--bandwidth-mbps", type=float)
@@ -57,6 +62,12 @@ def main():
     common = ["--scheme", args.scheme, "--phase", args.phase, "--warmup", str(warmup), "--measured", str(measured)]
     if args.smoke:
         common.append("--smoke")
+    common += ["--attempt-limit", str(args.attempt_limit), "--attempt-window-ms", str(args.attempt_window_ms)]
+    common += ["--deadline-ms", str(args.deadline_ms)]
+    if args.delivery_bound_ms is not None:
+        common += ["--delivery-bound-ms", str(args.delivery_bound_ms)]
+    if args.ls_outcome_probe:
+        common.append("--ls-outcome-probe")
     failures = []
     for n, t in grid:
         if args.kind == "local":
