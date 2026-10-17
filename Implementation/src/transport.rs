@@ -41,8 +41,19 @@ pub enum Node {
 
 impl Node {
     pub fn provider(id: u32, clock_window_ms: u64) -> Self {
+        Self::provider_with_attempt_policy(id, clock_window_ms, 100, 60_000)
+    }
+
+    pub fn provider_with_attempt_policy(
+        id: u32,
+        clock_window_ms: u64,
+        limit: u32,
+        window_ms: u64,
+    ) -> Self {
         Self::Provider {
-            upspa: Box::new(UpSpaProvider::new(id, clock_window_ms)),
+            upspa: Box::new(
+                UpSpaProvider::new(id, clock_window_ms).with_attempt_policy(limit, window_ms),
+            ),
             tspa: TspaProvider::new(id, Scalar::ONE),
         }
     }
@@ -51,9 +62,12 @@ impl Node {
         let result = match request {
             Request::Reset => {
                 *self = match self {
-                    Self::Provider { upspa, .. } => {
-                        Self::provider(upspa.provider_id, upspa.clock_window_ms)
-                    }
+                    Self::Provider { upspa, .. } => Self::provider_with_attempt_policy(
+                        upspa.provider_id,
+                        upspa.clock_window_ms,
+                        upspa.attempt_limit,
+                        upspa.attempt_window_ms,
+                    ),
                     Self::LoginServer(_) => Self::LoginServer(LoginServer::default()),
                 };
                 Ok(Reply::Ack(true))
@@ -91,11 +105,20 @@ pub struct InMemoryTransport {
 
 impl InMemoryTransport {
     pub fn new(n: usize, clock_window_ms: u64) -> Self {
+        Self::with_attempt_policy(n, clock_window_ms, 100, 60_000)
+    }
+
+    pub fn with_attempt_policy(n: usize, clock_window_ms: u64, limit: u32, window_ms: u64) -> Self {
         let mut nodes: HashMap<_, _> = (1..=n)
             .map(|id| {
                 (
                     Target::Provider(id as u32),
-                    Arc::new(StdMutex::new(Node::provider(id as u32, clock_window_ms))),
+                    Arc::new(StdMutex::new(Node::provider_with_attempt_policy(
+                        id as u32,
+                        clock_window_ms,
+                        limit,
+                        window_ms,
+                    ))),
                 )
             })
             .collect();
