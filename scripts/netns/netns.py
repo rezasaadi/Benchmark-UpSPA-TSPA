@@ -223,6 +223,7 @@ def run(args):
             cmd = ["ip", "netns", "exec", entry["namespace"], str(node), "--listen", entry["ip"] + ":42000", "--allow-benchmark-reset", "--clock-window-ms", str(args.clock_window_ms)]
             if entry["namespace"] != "bench-ls":
                 cmd += ["--provider-id", str(index + 1)]
+                cmd += ["--attempt-limit", str(args.attempt_limit), "--attempt-window-ms", str(args.attempt_window_ms)]
             processes.append(subprocess.Popen(cmd, stdout=file, stderr=subprocess.STDOUT))
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -238,6 +239,11 @@ def run(args):
                "--clock-window-ms", str(args.clock_window_ms), "--endpoints", str(args.state / "endpoints.json"), "--profile-metadata", str(args.state / "profile.json"), "--ping", str(args.state / "ping.json"), "--out", str(args.out)]
         if args.smoke:
             cmd.append("--smoke")
+        cmd += ["--attempt-limit", str(args.attempt_limit), "--attempt-window-ms", str(args.attempt_window_ms)]
+        if args.delivery_bound_ms is not None:
+            cmd += ["--delivery-bound-ms", str(args.delivery_bound_ms)]
+        if args.ls_outcome_probe:
+            cmd.append("--ls-outcome-probe")
         print(shlex.join(cmd), flush=True)
         status = subprocess.run(cmd).returncode
         if args.out.exists():
@@ -285,7 +291,11 @@ def main():
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--measured", type=int, default=20)
     p.add_argument("--deadline-ms", type=int, default=10000)
+    p.add_argument("--delivery-bound-ms", type=int)
+    p.add_argument("--ls-outcome-probe", action="store_true")
     p.add_argument("--clock-window-ms", type=int, default=300000)
+    p.add_argument("--attempt-limit", type=int, default=100)
+    p.add_argument("--attempt-window-ms", type=int, default=60000)
     p.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     args.state = args.state.resolve()
