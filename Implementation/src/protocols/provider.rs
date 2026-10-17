@@ -13,6 +13,13 @@ pub enum Replacement {
 pub struct Pending {
     pub binding: Binding,
     pub replacement: Replacement,
+    pub timestamp_old: Option<u64>,
+}
+
+#[derive(Clone)]
+struct AttemptWindow {
+    started_ms: u64,
+    count: u32,
 }
 
 #[derive(Clone)]
@@ -23,6 +30,9 @@ pub struct UpSpaProvider {
     pub pending: HashMap<RecordId, Pending>,
     pub completed: HashMap<Binding, bool>,
     pub clock_window_ms: u64,
+    pub attempt_limit: u32,
+    pub attempt_window_ms: u64,
+    attempts: HashMap<(Vec<u8>, u64), AttemptWindow>,
 }
 
 impl UpSpaProvider {
@@ -34,15 +44,32 @@ impl UpSpaProvider {
             pending: HashMap::new(),
             completed: HashMap::new(),
             clock_window_ms,
+            attempt_limit: 100,
+            attempt_window_ms: 60_000,
+            attempts: HashMap::new(),
         }
     }
 
-    fn prepare(&mut self, binding: Binding, replacement: Replacement) -> Result<Reply> {
+    pub fn with_attempt_policy(mut self, limit: u32, window_ms: u64) -> Self {
+        self.attempt_limit = limit;
+        self.attempt_window_ms = window_ms;
+        self
+    }
+
+    fn prepare(
+        &mut self,
+        binding: Binding,
+        replacement: Replacement,
+        timestamp_old: Option<u64>,
+    ) -> Result<Reply> {
         if self.completed.contains_key(&binding) {
             return Err("session already finalized".into());
         }
         if let Some(pending) = self.pending.get(&binding.record) {
-            return if pending.binding == binding && pending.replacement == replacement {
+            return if pending.binding == binding
+                && pending.replacement == replacement
+                && pending.timestamp_old == timestamp_old
+            {
                 Ok(Reply::Ack(true))
             } else {
                 Err("pending conflict".into())
@@ -53,6 +80,7 @@ impl UpSpaProvider {
             Pending {
                 binding,
                 replacement,
+                timestamp_old,
             },
         );
         Ok(Reply::Ack(true))
@@ -79,6 +107,7 @@ impl UpSpaProvider {
                         record: RecordId::Root(root.uid.clone()),
                     },
                     Replacement::Root(root),
+                    None,
                 )
             }
             UpRequest::Identify { uid, blinded } => {
@@ -86,6 +115,23 @@ impl UpSpaProvider {
                 let point = CompressedRistretto(blinded)
                     .decompress()
                     .ok_or("invalid point")?;
+                let attempts =
+                    self.attempts
+                        .entry((uid, root.timestamp))
+                        .or_insert(AttemptWindow {
+                            started_ms: now,
+                            count: 0,
+                        });
+                if self.attempt_window_ms != 0
+                    && now.saturating_sub(attempts.started_ms) >= self.attempt_window_ms
+                {
+                    attempts.started_ms = now;
+                    attempts.count = 0;
+                }
+                if attempts.count >= self.attempt_limit {
+                    return Err("attempt limit".into());
+                }
+                attempts.count += 1;
                 Ok(Reply::Identification {
                     cid: root.cid.clone(),
                     timestamp: root.timestamp,
@@ -113,7 +159,7 @@ impl UpSpaProvider {
                         if expected.is_some() && self.accounts.get(&suid) == expected.as_ref() => {}
                     _ => return Err("account precondition failed".into()),
                 }
-                self.prepare(binding, Replacement::Account(ciphertext))
+                self.prepare(binding, Replacement::Account(ciphertext), None)
             }
             UpRequest::PasswordUpdate(update) => {
                 let old = self.roots.get(&update.uid).ok_or("unknown root")?;
@@ -156,6 +202,7 @@ impl UpSpaProvider {
                         record: RecordId::Root(update.uid),
                     },
                     Replacement::Root(root),
+                    Some(update.timestamp_old),
                 )
             }
             UpRequest::Finalize { binding, store } => {
@@ -167,7 +214,20 @@ impl UpSpaProvider {
                     .get(&binding.record)
                     .is_some_and(|p| p.binding == binding)
                 {
-                    return Ok(Reply::Ack(false));
+                    if !store {
+                        // Remember an empty Discard so a late preparation cannot revive it.
+                        self.completed.insert(binding, false);
+                    }
+                    return Ok(Reply::Ack(!store));
+                }
+                if store && binding.phase == Phase::PasswordUpdate {
+                    let pending = &self.pending[&binding.record];
+                    let RecordId::Root(uid) = &binding.record else {
+                        return Ok(Reply::Ack(false));
+                    };
+                    if self.roots.get(uid).map(|root| root.timestamp) != pending.timestamp_old {
+                        return Ok(Reply::Ack(false));
+                    }
                 }
                 let pending = self.pending.remove(&binding.record).unwrap();
                 if store {
