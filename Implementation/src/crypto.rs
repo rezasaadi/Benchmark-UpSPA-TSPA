@@ -5,6 +5,7 @@ use chacha20poly1305::{
 };
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
 use rand_core::RngCore;
+use zeroize::Zeroizing;
 
 pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
@@ -36,22 +37,22 @@ pub fn hash_to_point(msg: &[u8]) -> RistrettoPoint {
     hasher.update(b"uptspa/hash_to_point");
     hasher.update(msg);
 
-    let mut wide = [0u8; 64];
-    hasher.finalize_xof().fill(&mut wide);
+    let mut wide = Zeroizing::new([0u8; 64]);
+    hasher.finalize_xof().fill(&mut *wide);
 
     RistrettoPoint::from_uniform_bytes(&wide)
 }
 
-pub fn oprf_finalize(password: &[u8], y: &RistrettoPoint) -> [u8; 32] {
-    let y_bytes = y.compress().to_bytes();
+pub fn oprf_finalize(password: &[u8], y: &RistrettoPoint) -> Zeroizing<[u8; 32]> {
+    let y_bytes = Zeroizing::new(y.compress().to_bytes());
 
     let mut h = blake3::Hasher::new();
     h.update(b"uptspa/oprf_finalize");
     h.update(password);
-    h.update(&y_bytes);
+    h.update(&*y_bytes);
 
     let out = h.finalize();
-    let mut r = [0u8; 32];
+    let mut r = Zeroizing::new([0u8; 32]);
     r.copy_from_slice(out.as_bytes());
     r
 }
@@ -68,15 +69,17 @@ pub fn xchacha_encrypt_detached<const PT_LEN: usize>(
     rng.fill_bytes(&mut nonce);
     let xnonce = XNonce::from_slice(&nonce);
 
-    let mut ct = *plaintext;
-    let tag = cipher.encrypt_in_place_detached(xnonce, aad, &mut ct).unwrap();
+    let mut ct = Zeroizing::new(*plaintext);
+    let tag = cipher
+        .encrypt_in_place_detached(xnonce, aad, &mut *ct)
+        .unwrap();
 
     let mut tag_bytes = [0u8; TAG_LEN];
     tag_bytes.copy_from_slice(tag.as_slice());
 
     CtBlob {
         nonce,
-        ct,
+        ct: *ct,
         tag: tag_bytes,
     }
 }
@@ -85,23 +88,21 @@ pub fn xchacha_decrypt_detached<const PT_LEN: usize>(
     key: &[u8; 32],
     aad: &[u8],
     blob: &CtBlob<PT_LEN>,
-) -> Result<[u8; PT_LEN], AeadError> {
+) -> Result<Zeroizing<[u8; PT_LEN]>, AeadError> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).unwrap();
     let xnonce = XNonce::from_slice(&blob.nonce);
 
-    let mut pt = blob.ct;
+    let mut pt = Zeroizing::new(blob.ct);
     let tag = GenericArray::from_slice(&blob.tag);
 
-    cipher.decrypt_in_place_detached(xnonce, aad, &mut pt, tag)?;
+    cipher.decrypt_in_place_detached(xnonce, aad, &mut *pt, tag)?;
     Ok(pt)
 }
 
 pub fn hash_upspa_suid(rsp: &[u8; 32], lsj: &[u8], provider_index: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"upspa/suid/v1");
     h.update(rsp);
-    h.update(lsj);
-    h.update(&provider_index.to_le_bytes());
+    h.update(&bincode::serialize(&("identifier", lsj, provider_index)).unwrap());
 
     let out = h.finalize();
     let mut r = [0u8; 32];
@@ -116,9 +117,8 @@ pub fn hash_suid(rsp: &[u8; 32], lsj: &[u8], provider_index: u32) -> [u8; 32] {
 
 pub fn hash_vinfo(rlsj: &[u8; 32], lsj: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"upspa/vinfo/v1");
     h.update(rlsj);
-    h.update(lsj);
+    h.update(&bincode::serialize(&("verifier", lsj)).unwrap());
 
     let out = h.finalize();
     let mut r = [0u8; 32];
@@ -126,26 +126,30 @@ pub fn hash_vinfo(rlsj: &[u8; 32], lsj: &[u8]) -> [u8; 32] {
     r
 }
 
-pub fn toprf_gen(nsp: usize, tsp: usize, rng: &mut impl RngCore) -> (Scalar, Vec<(u32, Scalar)>) {
+pub fn toprf_gen(
+    nsp: usize,
+    tsp: usize,
+    rng: &mut impl RngCore,
+) -> (Zeroizing<Scalar>, Zeroizing<Vec<(u32, Scalar)>>) {
     assert!(tsp >= 1 && tsp <= nsp);
 
-    let a0 = random_scalar(rng);
-    let mut coeffs = vec![a0];
+    let a0 = Zeroizing::new(random_scalar(rng));
+    let mut coeffs = Zeroizing::new(vec![*a0]);
     for _ in 1..tsp {
         coeffs.push(random_scalar(rng));
     }
 
     fn eval(coeffs: &[Scalar], x: Scalar) -> Scalar {
-        let mut acc = Scalar::ZERO;
-        let mut pow = Scalar::ONE;
+        let mut acc = Zeroizing::new(Scalar::ZERO);
+        let mut pow = Zeroizing::new(Scalar::ONE);
         for c in coeffs {
-            acc += c * pow;
-            pow *= x;
+            *acc += c * *pow;
+            *pow *= x;
         }
-        acc
+        *acc
     }
 
-    let mut shares = Vec::with_capacity(nsp);
+    let mut shares = Zeroizing::new(Vec::with_capacity(nsp));
     for i in 1..=nsp {
         shares.push((i as u32, eval(&coeffs, Scalar::from(i as u64))));
     }
@@ -176,17 +180,18 @@ pub fn toprf_client_eval(
     r: Scalar,
     partials: &[RistrettoPoint],
     lambdas: &[Scalar],
-) -> [u8; 32] {
+) -> Zeroizing<[u8; 32]> {
+    let r = Zeroizing::new(r);
     let p = hash_to_point(password);
-    let blinded = p * r;
+    let blinded = p * *r;
     std::hint::black_box(blinded.compress());
 
-    let mut acc = RistrettoPoint::identity();
+    let mut acc = Zeroizing::new(RistrettoPoint::identity());
     for (y, l) in partials.iter().zip(lambdas) {
-        acc += y * l;
+        *acc += y * l;
     }
 
-    let y = acc * r.invert();
+    let y = Zeroizing::new(*acc * r.invert());
     oprf_finalize(password, &y)
 }
 
@@ -195,20 +200,21 @@ pub fn toprf_client_eval_from_partials(
     r: Scalar,
     partials: &[RistrettoPoint],
     lambdas: &[Scalar],
-) -> [u8; 32] {
-    let mut acc = RistrettoPoint::identity();
+) -> Zeroizing<[u8; 32]> {
+    let r = Zeroizing::new(r);
+    let mut acc = Zeroizing::new(RistrettoPoint::identity());
     for (y, l) in partials.iter().zip(lambdas) {
-        acc += y * l;
+        *acc += y * l;
     }
 
-    let y = acc * r.invert();
+    let y = Zeroizing::new(*acc * r.invert());
     oprf_finalize(password, &y)
 }
 
 pub fn random_scalar(rng: &mut impl RngCore) -> Scalar {
     loop {
-        let mut wide = [0u8; 64];
-        rng.fill_bytes(&mut wide);
+        let mut wide = Zeroizing::new([0u8; 64]);
+        rng.fill_bytes(&mut *wide);
         let s = Scalar::from_bytes_mod_order_wide(&wide);
         if s != Scalar::ZERO {
             return s;
