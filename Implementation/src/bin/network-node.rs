@@ -13,6 +13,10 @@ struct Args {
     provider_id: Option<u32>,
     #[arg(long, default_value_t = 300_000)]
     clock_window_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    attempt_limit: u32,
+    #[arg(long, default_value_t = 60_000)]
+    attempt_window_ms: u64,
     #[arg(long)]
     allow_benchmark_reset: bool,
 }
@@ -22,7 +26,12 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let node = match args.provider_id {
         Some(0) => anyhow::bail!("provider ids are one-based"),
-        Some(id) => Node::provider(id, args.clock_window_ms),
+        Some(id) => Node::provider_with_attempt_policy(
+            id,
+            args.clock_window_ms,
+            args.attempt_limit,
+            args.attempt_window_ms,
+        ),
         None => Node::LoginServer(LoginServer::default()),
     };
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
