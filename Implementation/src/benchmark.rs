@@ -1,5 +1,8 @@
 use crate::{
-    protocols::{messages::*, system::System},
+    protocols::{
+        messages::*,
+        system::{RngMode, System},
+    },
     transport::{InMemoryTransport, NetworkTransport, Target, Transport},
 };
 use clap::{Parser, ValueEnum};
@@ -44,8 +47,16 @@ pub struct Args {
     pub ping: Option<PathBuf>,
     #[arg(long, default_value_t = 10000)]
     pub deadline_ms: u64,
+    #[arg(long)]
+    pub delivery_bound_ms: Option<u64>,
+    #[arg(long)]
+    pub ls_outcome_probe: bool,
     #[arg(long, default_value_t = 300000)]
     pub clock_window_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    pub attempt_limit: u32,
+    #[arg(long, default_value_t = 60_000)]
+    pub attempt_window_ms: u64,
     #[arg(long)]
     pub smoke: bool,
 }
@@ -162,7 +173,7 @@ pub fn phases(scheme: &str, selected: &str) -> anyhow::Result<Vec<(Protocol, Pha
 
 const UID: &[u8] = b"user123";
 const LS: &[u8] = b"LS1";
-const LOGIN: &[u8] = b"stable-login-user";
+const LOGIN: &[u8] = UID;
 const PASSWORD: &[u8] = b"benchmark password";
 const NEW_PASSWORD: &[u8] = b"updated benchmark password";
 
@@ -298,7 +309,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         )
     } else {
         (
-            Arc::new(InMemoryTransport::new(args.n_sp, args.clock_window_ms)),
+            Arc::new(InMemoryTransport::with_attempt_policy(
+                args.n_sp,
+                args.clock_window_ms,
+                args.attempt_limit,
+                args.attempt_window_ms,
+            )),
             Profile {
                 network_profile: "local".into(),
                 ..Default::default()
@@ -341,7 +357,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             "mode": mode, "warmup": warmup, "measured": measured, "n_sp": args.n_sp, "t_sp": args.t_sp,
             "purpose": if args.smoke { "smoke" } else { "measurement" },
             "scheme": args.scheme, "phase": args.phase, "deadline_ms": args.deadline_ms, "clock_window_ms": args.clock_window_ms,
-            "rng": "ChaCha20 deterministic per protocol/phase/run; protocol randomness included in client timing",
+            "rng": "deterministic-per-run",
+            "attempt_limit": args.attempt_limit, "attempt_window_ms": args.attempt_window_ms,
+            "delivery_bound_ms": args.delivery_bound_ms.unwrap_or(args.deadline_ms),
+            "ls_outcome_probe": args.ls_outcome_probe,
             "timer": "std::time::Instant", "profile": "release", "bytes_scope": "application framing; late threshold replies drained after phase timer; failed transport byte counts unknown"
         }))?,
     )?;
@@ -368,8 +387,18 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 .as_bytes(),
             )
             .as_bytes();
-            let mut system = System::new(args.n_sp, args.t_sp, transport.clone(), seed, timeout)
-                .map_err(anyhow::Error::msg)?;
+            let mut system = System::new(
+                args.n_sp,
+                args.t_sp,
+                transport.clone(),
+                RngMode::Deterministic(seed),
+                timeout,
+            )
+            .map_err(anyhow::Error::msg)?
+            .with_ls_outcome_probe(args.ls_outcome_probe)
+            .with_delivery_bound(Duration::from_millis(
+                args.delivery_bound_ms.unwrap_or(args.deadline_ms),
+            ));
             let fixture_result = fixture(&mut system, protocol, phase).await;
             let mut elapsed = None;
             let result = match fixture_result {
