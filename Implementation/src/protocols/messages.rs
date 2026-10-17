@@ -60,7 +60,6 @@ impl PasswordUpdate {
     pub fn signed_bytes(&self) -> Vec<u8> {
         bincode::serialize(&(
             &self.operation,
-            self.sid,
             &self.uid,
             self.provider_id,
             self.timestamp_old,
